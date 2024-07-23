@@ -1,0 +1,13 @@
+# Assuming all_segments_array is your input data with shape (num_segments, segment_length, num_channels)
+num_layers = 4
+d_model = 128
+num_heads = 8
+dff = 512
+input_sequence_length = 150
+num_channels = 5
+
+transformer = TransformerModel(num_layers, d_model, num_heads, dff, input_sequence_length, num_channels)
+
+# Example usage with your data
+outputs = transformer(all_segments_array, training=True)
+print(outputs.shape)  # Shape should be (num_segments, segment_length, d_model)
