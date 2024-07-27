@@ -1,0 +1,189 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import StepLR
+import os
+from google.colab import drive
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+def read_and_segment(file_path, segment_length=150, num_channels=5):
+    try:
+        all_values = []
+        with open(file_path, 'r') as file:
+            next(file)  # skip the header row
+            for line in file:
+                values = line.strip().split()
+                if len(values) != num_channels:
+                    print(f"Warning: Line in {file_path} does not have {num_channels} values. Skipping.")
+                    continue
+                all_values.extend(values)
+        if len(all_values) < segment_length * num_channels:
+            print(f"Warning: Not enough data in {file_path}. Skipping.")
+            return None
+        num_segments = len(all_values) // (segment_length * num_channels)
+        input_array = np.array(all_values[:num_segments * segment_length * num_channels], dtype=float).reshape(num_segments, segment_length, num_channels)
+        return input_array
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None
+
+# Load data
+emg_directories = ['/content/drive/My Drive/EMG/A_TXT', '/content/drive/My Drive/EMG/N_TXT']
+all_segments = []
+all_labels = []
+
+print("Starting data loading process...")
+
+for label, emg_directory in enumerate(emg_directories):
+    print(f"Processing directory: {emg_directory}")
+    if not os.path.exists(emg_directory):
+        print(f"Directory does not exist: {emg_directory}")
+        continue
+    
+    files = [f for f in os.listdir(emg_directory) if f.endswith('.txt')]
+    print(f"Found {len(files)} .txt files in the directory")
+    
+    for filename in files:
+        file_path = os.path.join(emg_directory, filename)
+        print(f"Processing file: {file_path}")
+        input_array = read_and_segment(file_path)
+        if input_array is not None:
+            print(f"Loaded array shape: {input_array.shape}")
+            all_segments.append(input_array)
+            all_labels.extend([label] * len(input_array))
+
+print(f"Total number of segments: {len(all_segments)}")
+print(f"Total number of labels: {len(all_labels)}")
+
+if len(all_segments) > 0:
+    all_segments = np.concatenate(all_segments, axis=0)
+    all_labels = np.array(all_labels)
+    print(f"Final shape of all_segments: {all_segments.shape}")
+    print(f"Final shape of all_labels: {all_labels.shape}")
+else:
+    raise ValueError("No data was loaded. Please check your file paths and data format.")
+
+class EMGDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = torch.FloatTensor(data)
+        self.labels = torch.LongTensor(labels)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
+
+class EMGTransformer(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, num_classes):
+        super(EMGTransformer, self).__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.fc = nn.Linear(d_model, num_classes)
+
+    def forward(self, src):
+        src = self.embedding(src)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src)
+        output = output.mean(dim=1)  # Global average pooling
+        output = self.fc(output)
+        return output
+
+# Hyperparameters
+input_dim = 5  # number of channels
+d_model = 64
+nhead = 8
+num_layers = 3
+num_classes = 2  # assuming binary classification (A_TXT vs N_TXT)
+batch_size = 32
+num_epochs = 50
+learning_rate = 0.001
+
+# Split data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(all_segments, all_labels, test_size=0.2, random_state=42)
+
+# Create datasets and dataloaders
+train_dataset = EMGDataset(X_train, y_train)
+test_dataset = EMGDataset(X_test, y_test)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# Initialize model, loss function, and optimizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = EMGTransformer(input_dim, d_model, nhead, num_layers, num_classes).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)  # Learning rate scheduler
+
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    for batch_data, batch_labels in train_loader:
+        batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(batch_data.transpose(1, 0))  # (seq_len, batch, input_dim)
+        loss = criterion(outputs, batch_labels)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+    
+    scheduler.step()
+    
+    # Validation
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_data, batch_labels in test_loader:
+            batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+            outputs = model(batch_data.transpose(1, 0))
+            _, predicted = torch.max(outputs.data, 1)
+            total += batch_labels.size(0)
+            correct += (predicted == batch_labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(train_loader):.4f}, Accuracy: {accuracy:.2f}%")
+
+print("Training complete!")
+
+# Final test
+model.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for batch_data, batch_labels in test_loader:
+        batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+        outputs = model(batch_data.transpose(1, 0))
+        _, predicted = torch.max(outputs.data, 1)
+        total += batch_labels.size(0)
+        correct += (predicted == batch_labels).sum().item()
+
+accuracy = 100 * correct / total
+print(f"Final Test Accuracy: {accuracy:.2f}%")
+
+# Save the model
+torch.save(model.state_dict(), 'emg_transformer_model.pth')
