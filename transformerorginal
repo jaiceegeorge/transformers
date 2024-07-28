@@ -11,31 +11,39 @@ from google.colab import drive
 # Mount Google Drive
 drive.mount('/content/drive')
 
-def read_and_segment(file_path, segment_length=150, num_channels=5):
+def read_and_segment(file_path, segment_length=150):
     try:
         all_values = []
         with open(file_path, 'r') as file:
             next(file)  # skip the header row
-            for line in file:
+            for line_num, line in enumerate(file, start=1):
                 values = line.strip().split()
-                if len(values) != num_channels:
-                    print(f"Warning: Line in {file_path} does not have {num_channels} values. Skipping.")
+                print(f"Line {line_num} in {file_path} has {len(values)} values: {values}")
+                if not values:  # Skip empty lines
                     continue
                 all_values.extend(values)
+        
+        if not all_values:
+            print(f"Warning: No valid data found in {file_path}. Skipping this file.")
+            return None, None
+        
+        num_channels = len(all_values) // segment_length
         if len(all_values) < segment_length * num_channels:
-            print(f"Warning: Not enough data in {file_path}. Skipping.")
-            return None
+            print(f"Warning: Not enough data in {file_path}. Found {len(all_values)} values, need at least {segment_length * num_channels}. Skipping this file.")
+            return None, None
+        
         num_segments = len(all_values) // (segment_length * num_channels)
         input_array = np.array(all_values[:num_segments * segment_length * num_channels], dtype=float).reshape(num_segments, segment_length, num_channels)
-        return input_array
+        return input_array, num_channels
     except Exception as e:
         print(f"Error processing file {file_path}: {str(e)}")
-        return None
+        return None, None
 
 # Load data
 emg_directories = ['/content/drive/My Drive/EMG/A_TXT', '/content/drive/My Drive/EMG/N_TXT']
 all_segments = []
 all_labels = []
+num_channels = None
 
 print("Starting data loading process...")
 
@@ -45,14 +53,23 @@ for label, emg_directory in enumerate(emg_directories):
         print(f"Directory does not exist: {emg_directory}")
         continue
     
-    files = [f for f in os.listdir(emg_directory) if f.endswith('.txt')]
-    print(f"Found {len(files)} .txt files in the directory")
+    files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+    print(f"Found {len(files)} .txt and .log files in the directory")
+    
+    if not files:
+        print(f"No .txt or .log files found in directory: {emg_directory}")
+        continue
     
     for filename in files:
         file_path = os.path.join(emg_directory, filename)
         print(f"Processing file: {file_path}")
-        input_array = read_and_segment(file_path)
+        input_array, file_num_channels = read_and_segment(file_path)
         if input_array is not None:
+            if num_channels is None:
+                num_channels = file_num_channels
+            elif file_num_channels != num_channels:
+                print(f"Warning: Number of channels in {file_path} ({file_num_channels}) differs from previous files ({num_channels}). Skipping this file.")
+                continue
             print(f"Loaded array shape: {input_array.shape}")
             all_segments.append(input_array)
             all_labels.extend([label] * len(input_array))
@@ -66,7 +83,24 @@ if len(all_segments) > 0:
     print(f"Final shape of all_segments: {all_segments.shape}")
     print(f"Final shape of all_labels: {all_labels.shape}")
 else:
-    raise ValueError("No data was loaded. Please check your file paths and data format.")
+    print("No data was loaded. Here's a summary of the attempted data loading process:")
+    for emg_directory in emg_directories:
+        print(f"\nDirectory: {emg_directory}")
+        if not os.path.exists(emg_directory):
+            print("  This directory does not exist.")
+        else:
+            files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+            print(f"  Number of .txt and .log files found: {len(files)}")
+            if files:
+                print("  First few files:")
+                for f in files[:5]:
+                    print(f"    {f}")
+            else:
+                print("  No .txt or .log files found in this directory.")
+    
+    raise ValueError("No data was loaded. Please check the error messages above, your file paths, and data format.")
+
+# The rest of your code (EMGDataset, PositionalEncoding, EMGTransformer, etc.) remains the same...
 
 class EMGDataset(Dataset):
     def __init__(self, data, labels):
@@ -111,7 +145,6 @@ class EMGTransformer(nn.Module):
         return output
 
 # Hyperparameters
-input_dim = 5  # number of channels
 d_model = 64
 nhead = 8
 num_layers = 3
@@ -125,12 +158,13 @@ X_train, X_test, y_train, y_test = train_test_split(all_segments, all_labels, te
 
 # Create datasets and dataloaders
 train_dataset = EMGDataset(X_train, y_train)
-test_dataset = EMGDataset(X_test, y_test)
+test_dataset = EMGDataset(X_test)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
 # Initialize model, loss function, and optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = all_segments.shape[2]  # Get the number of channels from the data
 model = EMGTransformer(input_dim, d_model, nhead, num_layers, num_classes).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
