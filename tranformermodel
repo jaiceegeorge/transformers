@@ -1,139 +1,227 @@
-import tensorflow as tf
-from tensorflow.keras import layers
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import StepLR
+import os
+from google.colab import drive
 
-class TransformerModel(tf.keras.Model):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_sequence_length, num_channels, rate=0.1):
-        super(TransformerModel, self).__init__()
-        self.encoder = TransformerEncoder(num_layers, d_model, num_heads, dff, input_sequence_length, num_channels, rate)
+# Mount Google Drive
+drive.mount('/content/drive')
 
-    def call(self, inputs, training):
-        return self.encoder(inputs, training)
+# Define part names
+part_names = ["RF", "BF", "VM", "ST", "FX"]
 
-class TransformerEncoder(tf.keras.layers.Layer):
-    def __init__(self, num_layers, d_model, num_heads, dff, input_sequence_length, num_channels, rate=0.1):
-        super(TransformerEncoder, self).__init__()
+def read_and_segment(file_path, segment_length=150):
+    try:
+        all_values = []
+        with open(file_path, 'r') as file:
+            next(file)  # skip the header row
+            for line_num, line in enumerate(file, start=1):
+                values = line.strip().split()
+                if not values:  # Skip empty lines
+                    continue
+                if len(values) != 5:
+                    print(f"Warning: Line {line_num} in {file_path} has {len(values)} values, expected 5. Skipping this line.")
+                    continue
+                print(f"Line {line_num} in {file_path} has {len(values)} values:")
+                for part_name, value in zip(part_names, values):
+                    print(f"{part_name}: {value}")
+                all_values.extend(values)
+        
+        if not all_values:
+            print(f"Warning: No valid data found in {file_path}. Skipping this file.")
+            return None, None
+        
+        num_channels = len(part_names)  # fixed to 5 as we expect 5 values per line
+        num_segments = len(all_values) // (segment_length * num_channels)
+        input_array = np.array(all_values[:num_segments * segment_length * num_channels], dtype=float).reshape(num_segments, segment_length, num_channels)
+        return input_array, num_channels
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None, None
 
-        self.d_model = d_model
-        self.num_layers = num_layers
+# Load data
+emg_directories = ['/content/drive/My Drive/EMG/A_TXT', '/content/drive/My Drive/EMG/N_TXT']
+all_segments = []
+all_labels = []
+num_channels = None
 
-        self.pos_encoding = self.positional_encoding(input_sequence_length, self.d_model)
+print("Starting data loading process...")
 
-        self.enc_layers = [EncoderLayer(d_model, num_heads, dff, rate) for _ in range(num_layers)]
+for label, emg_directory in enumerate(emg_directories):
+    print(f"Processing directory: {emg_directory}")
+    if not os.path.exists(emg_directory):
+        print(f"Directory does not exist: {emg_directory}")
+        continue
+    
+    files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+    print(f"Found {len(files)} .txt and .log files in the directory")
+    
+    if not files:
+        print(f"No .txt or .log files found in directory: {emg_directory}")
+        continue
+    
+    for filename in files:
+        file_path = os.path.join(emg_directory, filename)
+        print(f"Processing file: {file_path}")
+        input_array, file_num_channels = read_and_segment(file_path)
+        if input_array is not None:
+            if num_channels is None:
+                num_channels = file_num_channels
+            elif file_num_channels != num_channels:
+                print(f"Warning: Number of channels in {file_path} ({file_num_channels}) differs from previous files ({num_channels}). Skipping this file.")
+                continue
+            print(f"Loaded array shape: {input_array.shape}")
+            all_segments.append(input_array)
+            all_labels.extend([label] * len(input_array))
 
-        self.dropout = layers.Dropout(rate)
+print(f"Total number of segments: {len(all_segments)}")
+print(f"Total number of labels: {len(all_labels)}")
 
-    def call(self, x, training):
-        seq_len = tf.shape(x)[1]
+if len(all_segments) > 0:
+    all_segments = np.concatenate(all_segments, axis=0)
+    all_labels = np.array(all_labels)
+    print(f"Final shape of all_segments: {all_segments.shape}")
+    print(f"Final shape of all_labels: {all_labels.shape}")
+else:
+    print("No data was loaded. Here's a summary of the attempted data loading process:")
+    for emg_directory in emg_directories:
+        print(f"\nDirectory: {emg_directory}")
+        if not os.path.exists(emg_directory):
+            print("  This directory does not exist.")
+        else:
+            files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+            print(f"  Number of .txt and .log files found: {len(files)}")
+            if files:
+                print("  First few files:")
+                for f in files[:5]:
+                    print(f"    {f}")
+            else:
+                print("  No .txt or .log files found in this directory.")
+    
+    raise ValueError("No data was loaded. Please check the error messages above, your file paths, and data format.")
 
-        x += self.pos_encoding[:, :seq_len, :]
+# The rest of your code (EMGDataset, PositionalEncoding, EMGTransformer, etc.) remains the same...
 
-        x = self.dropout(x, training=training)
+class EMGDataset(Dataset):
+    def __init__(self, data, labels):
+        self.data = torch.FloatTensor(data)
+        self.labels = torch.LongTensor(labels)
 
-        for i in range(self.num_layers):
-            x = self.enc_layers[i](x, training)
+    def __len__(self):
+        return len(self.data)
 
-        return x
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
 
-    def positional_encoding(self, position, d_model):
-        angle_rads = self.get_angles(np.arange(position)[:, tf.newaxis],
-                                     np.arange(d_model)[tf.newaxis, :],
-                                     d_model)
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(0, 1)
+        self.register_buffer('pe', pe)
 
-        # apply sin to even indices in the array; 2i
-        angle_rads[:, 0::2] = tf.math.sin(angle_rads[:, 0::2])
+    def forward(self, x):
+        return x + self.pe[:x.size(0), :]
 
-        # apply cos to odd indices in the array; 2i+1
-        angle_rads[:, 1::2] = tf.math.cos(angle_rads[:, 1::2])
+class EMGTransformer(nn.Module):
+    def __init__(self, input_dim, d_model, nhead, num_layers, num_classes):
+        super(EMGTransformer, self).__init__()
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layers = nn.TransformerEncoderLayer(d_model, nhead)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.fc = nn.Linear(d_model, num_classes)
 
-        pos_encoding = angle_rads[np.newaxis, ...]
+    def forward(self, src):
+        src = self.embedding(src)
+        src = self.pos_encoder(src)
+        output = self.transformer_encoder(src)
+        output = output.mean(dim=1)  # Global average pooling
+        output = self.fc(output)
+        return output
 
-        return tf.cast(pos_encoding, dtype=tf.float32)
+# Hyperparameters
+d_model = 64
+nhead = 8
+num_layers = 3
+num_classes = 2  # assuming binary classification (A_TXT vs N_TXT)
+batch_size = 32
+num_epochs = 50
+learning_rate = 0.001
 
-    def get_angles(self, pos, i, d_model):
-        angle_rates = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
-        return pos * angle_rates
+# Split data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(all_segments, all_labels, test_size=0.2, random_state=42)
 
-class EncoderLayer(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads, dff, rate=0.1):
-        super(EncoderLayer, self).__init__()
+# Create datasets and dataloaders
+train_dataset = EMGDataset(X_train, y_train)
+test_dataset = EMGDataset(X_test, y_test)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-        self.mha = MultiHeadAttention(d_model, num_heads)
-        self.ffn = point_wise_feed_forward_network(d_model, dff)
+# Initialize model, loss function, and optimizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+input_dim = all_segments.shape[2]  # Get the number of channels from the data
+model = EMGTransformer(input_dim, d_model, nhead, num_layers, num_classes).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = StepLR(optimizer, step_size=10, gamma=0.1)  # Learning rate scheduler
 
-        self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    total_loss = 0
+    for batch_data, batch_labels in train_loader:
+        batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(batch_data.transpose(1, 0))  # (seq_len, batch, input_dim)
+        loss = criterion(outputs, batch_labels)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+    
+    scheduler.step()
+    
+    # Validation
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_data, batch_labels in test_loader:
+            batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+            outputs = model(batch_data.transpose(1, 0))
+            _, predicted = torch.max(outputs.data, 1)
+            total += batch_labels.size(0)
+            correct += (predicted == batch_labels).sum().item()
+    
+    accuracy = 100 * correct / total
+    print(f"Epoch {epoch+1}/{num_epochs}, Loss: {total_loss/len(train_loader):.4f}, Accuracy: {accuracy:.2f}%")
 
-        self.dropout1 = layers.Dropout(rate)
-        self.dropout2 = layers.Dropout(rate)
+print("Training complete!")
 
-    def call(self, x, training):
-        attn_output, _ = self.mha(x, x, x, None)
-        attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.layernorm1(x + attn_output)
+# Final test
+model.eval()
+correct = 0
+total = 0
+with torch.no_grad():
+    for batch_data, batch_labels in test_loader:
+        batch_data, batch_labels = batch_data.to(device), batch_labels.to(device)
+        outputs = model(batch_data.transpose(1, 0))
+        _, predicted = torch.max(outputs.data, 1)
+        total += batch_labels.size(0)
+        correct += (predicted == batch_labels).sum().item()
 
-        ffn_output = self.ffn(out1)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.layernorm2(out1 + ffn_output)
+accuracy = 100 * correct / total
+print(f"Final Test Accuracy: {accuracy:.2f}%")
 
-        return out2
-
-class MultiHeadAttention(tf.keras.layers.Layer):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        self.num_heads = num_heads
-        self.d_model = d_model
-
-        assert d_model % self.num_heads == 0
-
-        self.depth = d_model // self.num_heads
-
-        self.wq = layers.Dense(d_model)
-        self.wk = layers.Dense(d_model)
-        self.wv = layers.Dense(d_model)
-
-        self.dense = layers.Dense(d_model)
-
-    def split_heads(self, x, batch_size):
-        x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
-        return tf.transpose(x, perm=[0, 2, 1, 3])
-
-    def call(self, v, k, q, mask):
-        batch_size = tf.shape(q)[0]
-
-        q = self.wq(q)
-        k = self.wk(k)
-        v = self.wv(v)
-
-        q = self.split_heads(q, batch_size)
-        k = self.split_heads(k, batch_size)
-        v = self.split_heads(v, batch_size)
-
-        scaled_attention, attention_weights = scaled_dot_product_attention(q, k, v, mask)
-
-        scaled_attention = tf.transpose(scaled_attention, perm=[0, 2, 1, 3])
-
-        concat_attention = tf.reshape(scaled_attention, (batch_size, -1, self.d_model))
-
-        output = self.dense(concat_attention)
-
-        return output, attention_weights
-
-def point_wise_feed_forward_network(d_model, dff):
-    return tf.keras.Sequential([
-        tf.keras.layers.Dense(dff, activation='relu'),
-        tf.keras.layers.Dense(d_model)
-    ])
-
-def scaled_dot_product_attention(q, k, v, mask):
-    matmul_qk = tf.matmul(q, k, transpose_b=True)
-    dk = tf.cast(tf.shape(k)[-1], tf.float32)
-    scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-
-    if mask is not None:
-        scaled_attention_logits += (mask * -1e9)
-
-    attention_weights = tf.nn.softmax(scaled_attention_logits, axis=-1)
-
-    output = tf.matmul(attention_weights, v)
-
-    return output, attention_weights
+# Save the model
+torch.save(model.state_dict(), 'emg_transformer_model.pth')
