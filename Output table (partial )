@@ -1,0 +1,112 @@
+import os
+import numpy as np
+import pandas as pd
+from google.colab import drive
+
+# Mount Google Drive
+drive.mount('/content/drive')
+
+# Define part names
+part_names = ["RF", "BF", "VM", "ST", "FX"]
+
+def read_and_segment(file_path, segment_length=150):
+    try:
+        all_values = []
+        line_values = []  # To store values for tabular output
+        with open(file_path, 'r') as file:
+            next(file)  # skip the header row
+            for line_num, line in enumerate(file, start=1):
+                values = line.strip().split()
+                if not values:  # Skip empty lines
+                    continue
+                if len(values) != 5:
+                    print(f"Warning: Line {line_num} in {file_path} has {len(values)} values, expected 5. Skipping this line.")
+                    continue
+                line_values.append(values)  # Store the line values for DataFrame
+                all_values.extend(values)
+
+        if not all_values:
+            print(f"Warning: No valid data found in {file_path}. Skipping this file.")
+            return None, None, None
+
+        num_channels = len(part_names)  # fixed to 5 as we expect 5 values per line
+        num_segments = len(all_values) // (segment_length * num_channels)
+        input_array = np.array(all_values[:num_segments * segment_length * num_channels], dtype=float).reshape(num_segments, segment_length, num_channels)
+
+        # Create DataFrame for the file
+        df = pd.DataFrame(line_values, columns=part_names)
+        return input_array, num_channels, df
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None, None, None
+
+# Load data
+emg_directories = ['/content/drive/My Drive/EMG/A_TXT', '/content/drive/My Drive/EMG/N_TXT']
+all_segments = []
+all_labels = []
+num_channels = None
+
+# DataFrame to store all files' data
+all_data_frames = {}
+
+print("Starting data loading process...")
+
+for label, emg_directory in enumerate(emg_directories):
+    print(f"Processing directory: {emg_directory}")
+    if not os.path.exists(emg_directory):
+        print(f"Directory does not exist: {emg_directory}")
+        continue
+
+    files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+    print(f"Found {len(files)} .txt and .log files in the directory")
+
+    if not files:
+        print(f"No .txt or .log files found in directory: {emg_directory}")
+        continue
+
+    for filename in files:
+        file_path = os.path.join(emg_directory, filename)
+        print(f"Processing file: {file_path}")
+        input_array, file_num_channels, df = read_and_segment(file_path)
+        if input_array is not None:
+            if num_channels is None:
+                num_channels = file_num_channels
+            elif file_num_channels != num_channels:
+                print(f"Warning: Number of channels in {file_path} ({file_num_channels}) differs from previous files ({num_channels}). Skipping this file.")
+                continue
+            print(f"Loaded array shape: {input_array.shape}")
+            all_segments.append(input_array)
+            all_labels.extend([label] * len(input_array))
+            all_data_frames[file_path] = df
+
+print(f"Total number of segments: {len(all_segments)}")
+print(f"Total number of labels: {len(all_labels)}")
+
+if len(all_segments) > 0:
+    all_segments = np.concatenate(all_segments, axis=0)
+    all_labels = np.array(all_labels)
+    print(f"Final shape of all_segments: {all_segments.shape}")
+    print(f"Final shape of all_labels: {all_labels.shape}")
+else:
+    print("No data was loaded. Here's a summary of the attempted data loading process:")
+    for emg_directory in emg_directories:
+        print(f"\nDirectory: {emg_directory}")
+        if not os.path.exists(emg_directory):
+            print("  This directory does not exist.")
+        else:
+            files = [f for f in os.listdir(emg_directory) if f.endswith(('.txt', '.log'))]
+            print(f"  Number of .txt and .log files found: {len(files)}")
+            if files:
+                print("  First few files:")
+                for f in files[:5]:
+                    print(f"    {f}")
+            else:
+                print("  No .txt or .log files found in this directory.")
+
+    raise ValueError("No data was loaded. Please check the error messages above, your file paths, and data format.")
+
+# Display the DataFrames
+for file_path, df in all_data_frames.items():
+    print(f"\nData for file: {file_path}")
+    print(df.head())  # Display the first few rows for brevity
+    print(df)  # Display the entire DataFrame for clarity
